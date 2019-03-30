@@ -92,7 +92,7 @@ class EmptyLayer(nn.Module):
     def __init__(self):
         super(EmptyLayer,self).__init__()
 
-class YOLOLayer(object):
+class YOLOLayer(nn.Module):
     """docstring for YOLOLayer. detection layer """
 
     def __init__(self, anchors,num_classes,img_dim):
@@ -121,4 +121,209 @@ class YOLOLayer(object):
         ByteTensor = torch.cuad.ByteTensor id x.is_cuda else torch.ByteTensor
 
         prediction = x.view(nB,nA,self.bbox_attrs,nG,nG).permute(0,1,3,4,2).contiguous()
-        
+
+        #get output
+        x = torch.sigmoid(prediction[...,0]) #center x
+        y = torch.sigmoid(prediction[...,1]) #center y
+        w = prediction[...,2]
+        h = prediction[...,3]
+        pred_conf = torch.sigmoid(prediction[...,4])
+        pred_cls = torch.sigmoid(prediction[...,4])
+
+        #calculate offsets for each grid
+        grid_x = torch.arrange(nG).repeat(nG,1).view([1,1,nG,nG]).type(FloatTensor)
+        grid_y = torch.arrange(nG).repeat(nG,1).t().view([1,1,nG,nG]).type(FloatTensor)
+        scale_anchors = FloatTensor([(a_w/stride ,a_h/stride) for a_w,a_h in self.anchors])
+        anchor_w = scale_anchors[:,0:1].view((1,nA,1,1))
+        anchor_h = scale_anchors[:,1:2].view((1,nA,1,1))
+
+        #add offsets and scale with anchors
+        pred_boxes = FloatTensor(prediction[...,:4].shape)
+        pred_boxes[...,0] = x.data + grid_x
+        pred_boxes[...,1] = y.data + grid_y
+        pred_boxes[...,2] = torch.exp(w.data) * anchor_w
+        pred_boxes[...,3] = torch.exp(h.data) * anchor_h
+
+        # training
+        if targets is not None:
+            if x.is_cuda:
+                self.mse_loss = self.mse_loss.cuda()
+                self.bce_loss = self.bce_loss.cuda()
+                self.ce_loss = self.ce_loss.cuda()
+
+            nGT,nCorrect,mask,conf_mask,tx,ty,tw,th,tconf,tcls = build_targets(
+                pred_boxes = pred_boxes.cpu().data,
+                pred_conf = pred_conf.cpu().data,
+                pre_cls = pred_cls.cpu().data,
+                target = targets.cpu().data,
+                anchors = scale_anchors.cpu().data,
+                num_anchors =nA,
+                num_classes = self.num_classes,
+                grid_size = nG,
+                ignore_thres = self.ignore_thres,
+                img_dim = self.image_dim,
+            )
+
+            nProposals =int((pred_conf >0.5).sum().item())
+            recall = float(nCorrect /nGT) if nGT else 1
+            precision = float(nCorrect/nProposals)
+
+            #handle masks
+            mask = Variable(mask.type(ByteTensor))
+            conf_mask = Variable(mask.type(ByteTensor))
+
+            #handle target variable
+            tx = Variable(tx.type(FloatTensor),requires_grad = False)
+            ty = Variable(ty.type(FloatTensor),requires_grad = False)
+            tw = Variable(tw.type(FloatTensor),requires_grad = False)
+            th = Varibale(th.type(FloatTensor),requires_grad = False)
+            tconf = Variable(tconf.type(FloatTensor),requires_grad = False)
+            tcls = Variable(tcls.type(FloatTensor),requires_grad = False)
+
+            #get conf mask where gt and where there is no gt
+            conf_mask_true = mask
+            conf_mask_false = conf_mask - mask
+
+            #Mask outputs to ignore non-existing objeccts
+            loss_x = self.mse_loss(x[mask],tx[mask])
+            loss_y = self.mse_loss(y[mask],ty[mask])
+            loss_w = self.mse_loss(w[mask],tw[mask])
+            loss_h = self.mse_loss(h[mask],yh[mask])
+            loss_conf = self.bce_loss(pred_conf[conf_mask_false],tconf[conf_mask_false])+
+                        self.bce_loss(pred_conf[conf_mask_true],tconf[conf_mask_true])
+            loss_cls = (1/nB) * self.ce_loss(pred_cls[mask],torch.argmax(tcls[mask],1))
+            loss = loss_x +loss_y+loss_h+loss_w+loss_conf+loss_cls
+
+            return(
+                loss,
+                loss_x.item(),
+                loss_y.item(),
+                loss_w.item(),
+                loss_h.item(),
+                loss_conf.item(),
+                loss_cls.item(),
+                recall,
+                precision,
+            )
+        else:
+            #if not training phase return predictions
+            output = torch.cat(
+                (
+                    pred_boxes.view(nB,-1,4) * stride,
+                    pred_conf.view(nB,-1,1),
+                    pred_cls.view(nB,-1,self.num_classes),
+                ),
+                -1,
+            )
+            return output
+
+class Darknet(object):
+    """docstring for Darknet. yolov3 object detection model"""
+    def __init__(self, config_path,img_size =416):
+        super(Darknet, self).__init__()
+        self.module_defs = parse_model_config(config_path)
+        self.hyperparams,self.module_list = create_modules(self.module_des)
+        self.img_size = img_size
+        self.seen = 0
+        self.header_info = np.array([0,0,0,self.seen,0])
+        self.loss_names = ["x","y","w","h","conf","cls","recall","precision"]
+
+    def forward(self,x,targets=None):
+        is_learning =targets is not None
+        output = []
+        self.losses = defaultdict(float)
+        for i,(module_def,module) in enumerate(zip(self.module_defs,self.module_list)):
+            if module_def["type"] in ["convolutional","upsample","maxpool"]:
+                x = module(x)
+            elif module_def["type"] =="route":
+                layer_i = [int(x) for x in module_def["layers"].split(",")]
+                x = torch.cat([layer_outputs[i] for i in layer_i],1)
+            elif module_def["type"] == "shortcut":
+                layer_i = int(module_def["form"])
+                x = layer_outputs[-1] + layer_outputs[layer_i]
+            elif module_def["type"] =="yolo":
+                #train phase:get loss
+                if is_training:
+                    x,*losses = module[0](x,targets)
+                    for name,loss in zip(self.loss_names,losses):
+                        self.losses[name] += loss
+                else:
+                    x = module(x)
+                output.append(x)
+
+            layer_outputs.append(x)
+        self.losses["recall"]/=3
+        self.losses["precision"]/=3
+        return sum(output) if is_training else torch.cat(output,1)
+
+    def load_weights(self,weights_path):
+        #open the weights file
+        fp =open(weights_path,"rb")
+        header =np.formfile(fp,dtype=np.int32,count=5) # first five are header values
+        #need to write header when saving weights
+        self.header_info = header
+
+        self.seen = header[3]
+
+        weights = np.formfile(fp,dtype=np.float32,count=5)
+        fp.close()
+
+        ptr = 0
+        for i,(module_def,module) in enumerate(zip(self.module_defs,self.module_list)):
+            if module_def["type"] =="convolutional":
+                conv_layer = module[0]
+                if module_def["batch_normalize"]:
+                    #load bn bias weights running mean and running variable
+                    bn_layer = module[1]
+                    num_b = bn_layer.bias.numel()
+                    #bias
+                    bn_b = torch.from_numpy(weights[ptr:ptr+num_b]).view_as(bn_layer.bias)
+                    bn_layer.bias.data.copy_(bn_b)
+                    ptr +=num_b
+                    #weights
+                    bn_w = torch.from_numpy(weights[ptr:ptr+num_b]).view_as(bn_layer.weightsß)
+                    bn_layer.weight.data.copy_(bn_w)
+                    ptr +=num_b
+                    #running mean
+                    bn_rm = torch.from_numpy(weights[ptr:ptr+num_b]).view_as(bn_layer.running_mean)
+                    bn_layer.running_mean.data.copy_(bn_rm)
+                    ptr +=num_b
+                    #runing var
+                    bn_rv = torch.from_numpy(weights[ptr:ptr+num_b]).view_as(bn_layer.running_var)
+                    bn_layer.running_var.data.copy_(bn_rv)
+                    ptr += num_b
+                else:
+                    #load conv.bias
+                    num_b = conv_layer.bias.numel()
+                    conv_b = torch.from_numpy(weights[ptr:ptr+num_b]).view_as(conv_layer.bias)
+                    conv_layer.bias.data.copy_(conv_b)
+                    ptr+=num_b
+
+                #load weights
+                num_w = conv_layer.weight.numel()
+                conv_w = torch.from_numpy(weights[ptr:ptr+num_b]).view_as(conv_layer.weight)
+                conv_layer.weight.data.copy_(conv_w)
+                ptr +=num_w
+
+    def save_weights(self,path,cutoff=-1):
+        fp = open(path,"wb")
+        self.header_info[3] =self.seen
+        self.header_info.tofile(fp)
+
+        #iterate throuth layerss
+        for i,(module_def,module) in enumerate(zip(self.module_defs[:cutoff],self.module_list[:cutoff])):
+            if module_def["type"] =="convolutional":
+                conv_layer = module[0]
+                #if batch norm  load bn first
+                if module_def["batch_normalize"]:
+                    bn_layer = module[1]
+                    bn_layer.bias.data.cpu().numpy().tofile(fp)
+                    bn_layer.weight.data.cpu().numpy().tofile(fp)
+                    bn_layer.running_mean.data.cpu().numpy().tofile(fp)
+                    bn_layer.running_var.data.cpu().numpy().tofile(fp)
+                #load conv bias
+                else:
+                    conv_layer.bias.data.cpu().numpy().tofile(fp)
+                #Load coonv weights
+                conv_layer.weight.data.cpu().numpy().tofile(fp)
+        fp.close()
