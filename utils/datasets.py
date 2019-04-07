@@ -60,6 +60,7 @@ class ListDataset(Dataset):
         img = np.array(Image.open(img_path))
 
         #handles image with less than three channels
+        #.rstrip() 删除string 字符串末尾指定字符 默认为空
 
         while len(img.shape) !=3:
             index +=1
